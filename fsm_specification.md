@@ -59,3 +59,14 @@ stateDiagram-v2
 | `EVALUATE_MOVE` | Victory or Draw detected | Set winner or draw status, generate `GAME_OVER` payload | `GAME_OVER` |
 | `GAME_OVER` | Match concluded | Broadcast final results to connected clients | `CLEANUP` |
 | `CLEANUP` | State reset complete | Reset board memory and return socket to listener loop | `WAITING_FOR_PLAYERS` |
+
+## 4. Disconnection & Error Handling Policies
+### 4.1 Invalid Moves & Out-of-Turn Enforcement
+- **Overwriting Spaces**: If a player attempts to place a marker on an already claimed board cell, the host rejects the packet and dispatches an `ERROR` message containing code `INVALID_COORDINATES`. The turn indicator remains unchanged and the server loop continues running safely.
+- **Out-of-Turn Play**: If a non-active player submits a `MOVE` payload while the other player is active, the engine responds with an `ERROR` message (`OUT_OF_TURN`) and maintains the current active turn state without crashing.
+
+### 4.2 Abrupt Disconnections & Session Recovery
+- **EOF & Exception Detection**: Sockets returning `0 bytes` (`b""`) or raising low-level network exceptions (`ConnectionResetError`, `BrokenPipeError`) trigger an immediate transition to `STATE_SUSPENDED`.
+- **Session Preservation**: Board grid configurations, active sequence IDs, and player roles are maintained in host memory.
+- **Reconnection & Forfeit**: When the disconnected client issues a `CONNECT` message specifying their registered `player_id`, the host re-binds the active socket, re-issues the pending `STATE_UPDATE`, and returns directly to `AWAIT_ACK`. If reconnect fails before 300 seconds, the engine declares an opponent victory by forfeit.
+- **Post-Game Reset**: Transitioning to `CLEANUP` flushes old match buffers and resets state variables, allowing subsequent game rounds without requiring a server process restart.
