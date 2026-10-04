@@ -35,3 +35,21 @@ Payload (Str): {"msg_type":"MOVE","player_id":"Player_X","payload":{"row":0,"col
 Stream Offset: 0000004C
 Header (Hex) : 00 00 00 7C  (Payload Length = 124 bytes)
 Payload (Str): {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"sequence_id":101,"board":["","","X","","","","","",""],"turn":"Player_Y"},"timestamp":1727000006}
+```
+### 3.1 Message Summary Table
+
+| Message Type | Direction | Purpose & Description |
+| :--- | :--- | :--- |
+| `CONNECT` | Client $\rightarrow$ Server | Client requests entry or session resume using `player_id`. |
+| `LOBBY_WAIT` | Server $\rightarrow$ Client | Server notifies Player X to await Player Y connection. |
+| `GAME_START` | Server $\rightarrow$ Client | Server announces game start and assigns symbols (`X` / `O`). |
+| `MOVE` | Client $\rightarrow$ Server | Active player submits move coordinates (`row`, `col`). |
+| `STATE_UPDATE` | Server $\rightarrow$ Client | Server broadcasts board state and `sequence_id` after a turn. |
+| `ACK_STATE` | Client $\rightarrow$ Server | Opponent confirms receipt and verification of board state. |
+| `STATE_RETRANSMIT` | Server $\rightarrow$ Client | Periodic ping re-sent after 10s if `ACK_STATE` is not received. |
+| `ERROR` | Server $\rightarrow$ Client | Server notifies client of invalid move, out-of-turn play, or malformed packet. |
+| `DISCONNECT` | Client $\rightarrow$ Server | Client indicates intent to quit gracefully. |
+| `GAME_OVER` | Server $\rightarrow$ Client | Server broadcasts match end, winner/draw status, and final scores. |
+---
+
+---
