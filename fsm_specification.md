@@ -41,3 +41,5 @@ stateDiagram-v2
 | `STATE_SUSPENDED` | Opponent connection dropped. Match paused awaiting session reconnect. |
 | `GAME_OVER` | Game concluded via victory, draw, or forfeit timeout. |
 | `CLEANUP` | Broadcasts final results and resets board state to accept new matches. |
+
+## State Transition Logic
