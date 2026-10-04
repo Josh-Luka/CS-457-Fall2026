@@ -14,19 +14,27 @@ This document specifies the custom application-layer messaging protocol designed
 - **Serialization Format**: UTF-8 Encoded JSON
 - **Byte Order**: Network Byte Order (Big-Endian, `!` in Python `struct`)
 
-### 2.2 Framing Rule: Fixed-Width Length-Prefixed Binary Header
-TCP is a continuous byte-stream protocol without inherent message boundaries. To guarantee reliable message boundaries, all wire transmissions are prepended with a fixed 4-byte unsigned integer header specifying the exact byte length of the UTF-8 serialized JSON payload.
+### 2.2 Framing Rule: Fixed-Width Length-Prefixed Binary Header (Option B)
+TCP is a continuous byte-stream protocol without inherent message boundaries. To guarantee reliable message boundaries and solve TCP stream fragmentation (messages split across multiple `recv()` calls) and coalescing (multiple back-to-back messages arriving in a single `recv()` chunk), all wire transmissions are prepended with a fixed 4-byte unsigned integer header specifying the exact byte length of the UTF-8 serialized JSON payload.
 
 $$\text{[ 4-Byte Header (Big-Endian UInt32) ]} + \text{[ N-Byte Serialized JSON Payload ]}$$
+
+#### Receiver Extraction Logic
+1. **Read Header**: Read exactly 4 bytes from the TCP stream using an exact-read buffer accumulator (`recv_exact(sock, 4)`).
+2. **Unpack Header**: Unpack the 4 bytes using Network Byte Order (`struct.unpack("!I", header)`), yielding payload byte length $N$.
+3. **Read Payload**: Read exactly $N$ bytes from the stream using the accumulator (`recv_exact(sock, N)`).
+4. **Deserialize**: Decode UTF-8 bytes to string and parse JSON object.
 
 #### Advantages
 1. **No Escaping/Delimiter Collisions**: Payloads can contain newlines, spaces, or raw text without breaking message boundary parsing.
 2. **Deterministic Allocation**: Receivers read exactly 4 bytes first, inspect payload length $N$, and allocate/read precisely $N$ bytes.
 3. **Immunity to Fragmentation/Coalescing**: Prevents partial JSON parsing errors when TCP segments are fragmented or merged across `recv()` calls.
 
-### 2.3 Wire Stream Examples (Continuous TCP Byte Stream)
+### 2.3 On-the-Wire Raw Byte Stream Examples (Continuous TCP Stream)
 
-#### Example 1: `MOVE` followed by `STATE_UPDATE` (Continuous Stream)
+#### Example 1: Stream Coalescing (`MOVE` followed immediately by `STATE_UPDATE`)
+Shows two complete back-to-back messages arriving in a single continuous byte stream.
+
 ```text
 Stream Offset: 00000000
 Header (Hex) : 00 00 00 48  (Payload Length = 72 bytes)
@@ -50,6 +58,4 @@ Payload (Str): {"msg_type":"STATE_UPDATE","player_id":"SERVER","payload":{"seque
 | `ERROR` | Server $\rightarrow$ Client | Server notifies client of invalid move, out-of-turn play, or malformed packet. |
 | `DISCONNECT` | Client $\rightarrow$ Server | Client indicates intent to quit gracefully. |
 | `GAME_OVER` | Server $\rightarrow$ Client | Server broadcasts match end, winner/draw status, and final scores. |
----
-
 ---
