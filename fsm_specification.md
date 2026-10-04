@@ -29,7 +29,7 @@ stateDiagram-v2
     
     CLEANUP --> WAITING_FOR_PLAYERS : Reset State
 ```
-##State Definitions
+## State Definitions
 | State Name | Description |
 | :--- | :--- |
 | `INIT` | Game host process initializes networking and socket bindings. |
