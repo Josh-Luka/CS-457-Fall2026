@@ -29,3 +29,14 @@ stateDiagram-v2
     
     CLEANUP --> WAITING_FOR_PLAYERS : Reset State
 ```
+| State Name | Description |
+| :--- | :--- |
+| `INIT` | Game host process initializes networking and socket bindings. |
+| `WAITING_FOR_PLAYERS` | Player X host starts listening for Player Y to connect. |
+| `GAME_START` | Both players connected; game board initialized and connection confirmed. |
+| `PLAYER_TURN` | Active player's turn. Out-of-turn moves or overwriting taken spaces trigger error payloads. |
+| `AWAIT_ACK` | Active player submitted move; host waiting for `ACK_STATE` from opponent. 10s timer active. |
+| `EVALUATE_MOVE` | Move verified via `ACK_STATE`; evaluates valid empty space placements, win/draw conditions, or turn toggles. |
+| `STATE_SUSPENDED` | Opponent connection dropped. Match paused awaiting session reconnect. |
+| `GAME_OVER` | Game concluded via victory, draw, or forfeit timeout. |
+| `CLEANUP` | Broadcasts final results and resets board state to accept new matches. |
