@@ -36,3 +36,30 @@ Round scores are maintained in the shared Game State Object as a Python dictiona
 
 **Broadcast Logic:** 
 Upon the completion of a round (triggered by a win condition or a draw), the thread handling the final valid `MOVE` acquires the state lock, updates the internal score dictionary, and generates a `GAME_OVER` message. The server iterates through the shared client socket list and transmits the length-prefixed `GAME_OVER` JSON payload—containing the `final_scores` mapping and the outcome reason—to both clients synchronously.
+
+## 4. State & Score Broadcast Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client1 as Client 1 (Player X)
+    participant Server as Game Server
+    actor Client2 as Client 2 (Player O)
+
+    Client1->>Server: MOVE (row: 0, col: 2)
+    
+    Note over Server: Thread 1 acquires lock.<br>Validates: Is it Player X's turn?<br>Is cell (0,2) empty?
+    
+    alt Valid Move
+        Note over Server: Update Board Array<br>Increment sequence_id<br>Switch Turn<br>Release lock.
+        Server-->>Client1: STATE_UPDATE (sequence_id: 101, turn: Player_Y)
+        Server-->>Client2: STATE_UPDATE (sequence_id: 101, turn: Player_Y)
+        
+        Note over Client1, Client2: Clients parse length-prefixed payload<br>Verify board state
+        Client1->>Server: ACK_STATE (sequence_id: 101, status: VERIFIED)
+        Client2->>Server: ACK_STATE (sequence_id: 101, status: VERIFIED)
+        
+    else Invalid / Out of Turn Move
+        Note over Server: Thread 1 identifies out-of-turn execution.<br>Releases lock.
+        Server-->>Client1: ERROR (error_code: OUT_OF_TURN)
+    end
