@@ -1,43 +1,36 @@
 # Server Concurrency & State Synchronization Architecture
 
-## 1. Server Concurrency Model Selection
-The server implements **Option A: Multi-Threading** using the Python `threading` module and standard blocking sockets. 
+## 1. Server Concurrency Architecture & Connection Lifecycle
+The server implements **Option A: Multi-Threading** using the Python `threading` module and blocking sockets. 
 
-**Execution Flow:** 
-The main server thread listens for incoming TCP connections. Upon a successful `accept()`, a dedicated worker thread (`threading.Thread`) is spawned to handle the new client socket. 
+**Complete Connection Lifecycle:**
+1. **Listening & Accept:** The main server thread binds to the designated port and enters an infinite `while True:` loop, calling `server_socket.accept()` to block and wait for incoming TCP connections.
+2. **Client Registration:** Upon connection, a new client socket is appended to the shared active client list. A dedicated worker thread (`threading.Thread`) is spawned, passing the client socket and address as arguments.
+3. **Active Game Loop Servicing:** Inside the worker thread, the server enters a `while True:` loop using the Sprint 1 framing protocol (`recv_exact(sock, 4)`) to read length-prefixed messages. The thread blocks waiting for data from its specific client without stalling the main server or the opponent's thread.
+4. **Socket Teardown:** If a client sends a `DISCONNECT` message, or if `recv()` returns `0` bytes (TCP EOF), or if a `ConnectionResetError` is caught, the worker thread triggers the teardown phase. It removes the socket from the shared client list, safely closes the socket (`sock.close()`), notifies the remaining opponent via a `GAME_OVER` (forfeit) message, and cleanly exits the thread.
 
-**Justification & Blocking I/O Compatibility:** 
-Because each client connection operates within its own isolated thread, the server can safely utilize the blocking `recv_exact(sock, 4)` length-prefixed framing extraction logic defined in the Sprint 1 protocol blueprint. The worker thread will block while awaiting the 4-byte Big-Endian header or the subsequent JSON payload without stalling the opponent's thread or the main server loop.
+## 2. Thread Safety, Lock Acquisition & State Isolation Strategy
+Because multiple worker threads run concurrently and mutate the same game session, shared memory structures must be strictly protected from race conditions.
 
-## 2. Thread Safety & Mutex Locking Strategy
-Because multiple client threads run concurrently and interact with the same underlying game instance, shared memory structures must be strictly protected from race conditions.
+**Explicit Shared Resources:** 
+The centralized Game State Object contains the following shared variables:
+* **Game Board Matrix:** The 9-element array representing the grid.
+* **Active Turn State:** The string/ID indicating whose turn it is.
+* **Connected Client Socket List:** Array of active TCP socket objects.
+* **Round Scores:** Dictionary mapping player IDs to their win count.
 
-**Shared State:** 
-The server maintains a centralized Game State Object in memory containing:
-* The 9-element board array.
-* The active turn tracker (`turn`).
-* The sequence ID counter (`sequence_id`).
-* The score dictionary.
-* The active client socket list.
-
-**Lock Acquisition Strategy:** 
-A single `threading.Lock()` (e.g., `game_state_lock`) is instantiated globally for the game session. Whenever a thread needs to evaluate or mutate the game state, it must acquire the lock (e.g., using a `with game_state_lock:` context manager). 
-
-**Critical Section Execution:**
-1. Thread acquires the lock.
-2. Thread verifies move validity against the current board state and turn tracker.
-3. Thread updates the board array, increments the `sequence_id`, and switches the active `turn`.
-4. Thread constructs the `STATE_UPDATE` payload and transmits it to the clients.
-5. Thread releases the lock.
+**Lock Acquisition (Critical Sections):** 
+A single global `threading.Lock()` (e.g., `game_state_lock`) is utilized. A critical section occurs anytime a thread processes a `MOVE` or alters the state.
+1. The thread receives a parsed JSON payload and requests the lock: `with game_state_lock:`
+2. **Validation:** It reads the "Active Turn State" and "Game Board Matrix" to ensure the move is legal.
+3. **Mutation:** It updates the board array, increments the sequence ID, and switches the turn. If a win/draw is detected, it updates the "Round Scores".
+4. **Broadcast:** While still holding the lock, it iterates through the "Connected Client Socket List" and calls `sock.sendall()` to transmit the new state to all clients synchronously.
+5. **Release:** The lock is automatically released upon exiting the `with` block, allowing the other thread to process subsequent moves.
 
 ## 3. Score & Leaderboard Synchronization Design
-**Memory Storage:** 
-Round scores are maintained in the shared Game State Object as a Python dictionary mapping the `player_id` to integer scores (e.g., `{"Player_X": 1, "Player_Y": 0}`). This dictionary is protected by the `game_state_lock`.
+Round scores are stored in server memory inside the shared dictionary. Upon detecting a win condition during the Critical Section lock, the server generates a `GAME_OVER` payload containing the updated `final_scores` leaderboard. The server broadcasts this payload synchronously to both clients, signaling them to display the updated scores and reset their local board UI for the next round.
 
-**Broadcast Logic:** 
-Upon the completion of a round (triggered by a win condition or a draw), the thread handling the final valid `MOVE` acquires the state lock, updates the internal score dictionary, and generates a `GAME_OVER` message. The server iterates through the shared client socket list and transmits the length-prefixed `GAME_OVER` JSON payload—containing the `final_scores` mapping and the outcome reason—to both clients synchronously.
-
-## 4. State & Score Broadcast Sequence Diagram
+## 4. Move Validation & State Broadcast Sequence Diagram
 
 ```mermaid
 sequenceDiagram
@@ -48,18 +41,21 @@ sequenceDiagram
 
     Client1->>Server: MOVE (row: 0, col: 2)
     
-    Note over Server: Thread 1 acquires lock.<br>Validates: Is it Player X's turn?<br>Is cell (0,2) empty?
+    Note over Server: Thread 1 acquires `game_state_lock`.<br>Validates: Is it Player X's turn?<br>Is cell (0,2) empty?
     
-    alt Valid Move
-        Note over Server: Update Board Array<br>Increment sequence_id<br>Switch Turn<br>Release lock.
-        Server-->>Client1: STATE_UPDATE (sequence_id: 101, turn: Player_Y)
-        Server-->>Client2: STATE_UPDATE (sequence_id: 101, turn: Player_Y)
+    alt Valid Move (Standard Turn)
+        Note over Server: Mutate State: Update Board Matrix.<br>Switch Turn State.
+        Server-->>Client1: STATE_UPDATE (Board, Turn: Player O)
+        Server-->>Client2: STATE_UPDATE (Board, Turn: Player O)
+        Note over Server: Thread 1 releases lock.
         
-        Note over Client1, Client2: Clients parse length-prefixed payload<br>Verify board state
-        Client1->>Server: ACK_STATE (sequence_id: 101, status: VERIFIED)
-        Client2->>Server: ACK_STATE (sequence_id: 101, status: VERIFIED)
+    else Valid Move (Win Condition & Score Sync)
+        Note over Server: Mutate State: Update Board Matrix.<br>Detect Win. Increment Round Scores.
+        Server-->>Client1: GAME_OVER (Winner: Player X, final_scores)
+        Server-->>Client2: GAME_OVER (Winner: Player X, final_scores)
+        Note over Server: Thread 1 releases lock.
         
     else Invalid / Out of Turn Move
-        Note over Server: Thread 1 identifies out-of-turn execution.<br>Releases lock.
+        Note over Server: Validation fails.<br>Thread 1 releases lock.
         Server-->>Client1: ERROR (error_code: OUT_OF_TURN)
     end
