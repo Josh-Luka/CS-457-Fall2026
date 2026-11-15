@@ -7,27 +7,28 @@ import os
 def send_message(sock, message):
     """Sprint 1: Length-prefix framing send logic"""
     encoded = message.encode('utf-8')
-    # Pack the length into a 4-byte big-endian unsigned integer
     msg_length = struct.pack('!I', len(encoded))
     sock.sendall(msg_length + encoded)
 
 def recv_message(sock):
-    """Sprint 1: Length-prefix framing receive logic"""
-    # 1. Read the 4-byte header
-    raw_msglen = recvall(sock, 4)
-    if not raw_msglen:
-        return None
-    # Unpack the 4-byte header to find out the payload size
-    msglen = struct.unpack('!I', raw_msglen)[0]
-    
-    # 2. Read exactly 'msglen' bytes for the payload
-    data = recvall(sock, msglen)
-    if not data:
-        return None
-    return data.decode('utf-8')
+    """Sprint 1: Length-prefix framing receive logic with timeout for responsive KeyboardInterrupt"""
+    sock.settimeout(1.0) # Allows Ctrl+C to break out immediately even when waiting
+    while True:
+        try:
+            raw_msglen = recvall(sock, 4)
+            if not raw_msglen:
+                return None
+            msglen = struct.unpack('!I', raw_msglen)[0]
+            data = recvall(sock, msglen)
+            if not data:
+                return None
+            return data.decode('utf-8')
+        except socket.timeout:
+            continue
+        except KeyboardInterrupt:
+            raise
 
 def recvall(sock, n):
-    """Helper to ensure exact byte counts are received from the TCP stream"""
     data = bytearray()
     while len(data) < n:
         packet = sock.recv(n - len(data))
@@ -45,7 +46,6 @@ def main():
     parser.add_argument('-p', '--port', required=True, type=int, help="Server port")
     args = parser.parse_args()
 
-    # Mandatory Sprint 3 Requirement: Graceful DNS Resolution Catch
     try:
         server_ip = socket.gethostbyname(args.hostname)
     except socket.gaierror:
@@ -55,16 +55,18 @@ def main():
         
     print(f"[SUCCESS] Resolved {args.hostname} to {server_ip}")
 
-    # Initialize TCP Socket
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
     try:
         client_socket.connect((server_ip, args.port))
         print(f"[CONNECTED] Connected to server at {server_ip}:{args.port}")
         
-        # Sprint 1 FSM Game Loop Client-Side Execution
         while True:
-            msg = recv_message(client_socket)
+            try:
+                msg = recv_message(client_socket)
+            except socket.timeout:
+                continue
+                
             if not msg:
                 print("\n[DISCONNECTED] Server closed the connection.")
                 break
@@ -77,12 +79,21 @@ def main():
                 move = input("Enter your move (1-9): ")
                 send_message(client_socket, move)
             elif msg == "WAITING":
-                print("\nWaiting for Player 2...")
+                print("\nWaiting for opponent's move...")
             elif msg == "INVALID_MOVE":
-                print("\n[!] Invalid move. Please try again.")
+                print("\n[!] Invalid move or spot already taken. Please try again.")
+            elif msg == "WIN":
+                print("\n*** CONGRATULATIONS! YOU WIN! ***")
+                break
+            elif msg == "LOSE":
+                print("\n*** GAME OVER. YOU LOSE! ***")
+                break
+            elif msg == "TIE":
+                print("\n*** IT'S A TIE! ***")
+                break
             elif msg.startswith("UPDATE"):
                 clear_screen()
-                print(msg[7:]) # Strip 'UPDATE\n' to render the board
+                print(msg[7:])
             else:
                 print(msg)
                 
@@ -90,7 +101,7 @@ def main():
         print(f"[ERROR] Connection refused. Is the server running on {server_ip}:{args.port}?")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n[DISCONNECTING] Exiting game...")
+        print("\n[DISCONNECTING] Exiting game gracefully...")
     finally:
         client_socket.close()
 
