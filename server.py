@@ -1,187 +1,437 @@
 import argparse
+import json
 import socket
-import threading
 import struct
+import sys
+import threading
 import time
+from typing import Any, Dict, List, Optional, Tuple
 
-def send_message(conn, message):
-    encoded = message.encode('utf-8')
-    msg_length = struct.pack('!I', len(encoded))
-    conn.sendall(msg_length + encoded)
 
-def recv_message(conn):
-    raw_msglen = recvall(conn, 4)
-    if not raw_msglen:
-        return None
-    msglen = struct.unpack('!I', raw_msglen)[0]
-    data = recvall(conn, msglen)
-    if not data:
-        return None
-    return data.decode('utf-8')
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8080
+GRACE_PERIOD_SECONDS = 60.0
+HEADER_STRUCT = struct.Struct("!I")
+MAX_PAYLOAD_BYTES = 65536
 
-def recvall(conn, n):
-    data = bytearray()
-    while len(data) < n:
-        packet = conn.recv(n - len(data))
-        if not packet:
+WIN_LINES: List[Tuple[int, int, int]] = [
+    (0, 1, 2),
+    (3, 4, 5),
+    (6, 7, 8),
+    (0, 3, 6),
+    (1, 4, 7),
+    (2, 5, 8),
+    (0, 4, 8),
+    (2, 4, 6),
+]
+
+
+def sendFramedMessage(sock: socket.socket, payload: Dict[str, Any]) -> None:
+    encoded = json.dumps(payload).encode("utf-8")
+    if len(encoded) > MAX_PAYLOAD_BYTES:
+        raise ValueError("Payload exceeds maximum allowed byte size.")
+    frame = HEADER_STRUCT.pack(len(encoded)) + encoded
+    sock.sendall(frame)
+
+
+def recvExact(sock: socket.socket, byteCount: int) -> Optional[bytes]:
+    chunks = bytearray()
+    while len(chunks) < byteCount:
+        remaining = byteCount - len(chunks)
+        chunk = sock.recv(remaining)
+        if not chunk:
             return None
-        data.extend(packet)
-    return data
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def recvFramedMessage(sock: socket.socket) -> Optional[Dict[str, Any]]:
+    rawHeader = recvExact(sock, HEADER_STRUCT.size)
+    if rawHeader is None:
+        return None
+    messageLength = HEADER_STRUCT.unpack(rawHeader)[0]
+    if messageLength <= 0 or messageLength > MAX_PAYLOAD_BYTES:
+        raise ValueError(f"Invalid framed message length: {messageLength}")
+    rawBody = recvExact(sock, messageLength)
+    if rawBody is None:
+        return None
+    decoded = json.loads(rawBody.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise ValueError("Decoded JSON frame must be an object.")
+    return decoded
+
+
+def evaluateBoard(board: List[str]) -> Tuple[Optional[str], bool]:
+    for idxA, idxB, idxC in WIN_LINES:
+        markA = board[idxA]
+        if markA != "" and markA == board[idxB] and markA == board[idxC]:
+            return markA, False
+    if "" not in board:
+        return None, True
+    return None, False
+
+
+class PlayerSession:
+    def __init__(self, alias: str, symbol: str, conn: Optional[socket.socket]) -> None:
+        self.alias = alias
+        self.symbol = symbol
+        self.conn = conn
+        self.status = "CONNECTED" if conn is not None else "TEMPORARILY_DISCONNECTED"
+        self.disconnectedAt: Optional[float] = None
+        self.sendLock = threading.Lock()
+
 
 class GameRoom:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.players = []          # List of tuples: (conn, addr)
-        self.current_turn = 0
-        self.board = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
-        self.game_over = False
+    def __init__(self, roomId: str) -> None:
+        self.roomId = roomId
+        self.stateLock = threading.Lock()
+        self.playersByAlias: Dict[str, PlayerSession] = {}
+        self.playersBySymbol: Dict[str, PlayerSession] = {}
+        self.board: List[str] = [""] * 9
+        self.scores: Dict[str, int] = {"X": 0, "O": 0, "TIES": 0}
+        self.activeTurn: str = "X"
+        self.gamePhase: str = "WAITING_FOR_PLAYERS"
+        self.graceDeadline: Optional[float] = None
+        self.graceTimer: Optional[threading.Timer] = None
 
-    def reset(self):
-        self.current_turn = 0
-        self.board = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
-        self.game_over = False
+    def buildStateSnapshot(self, eventType: str, message: str) -> Dict[str, Any]:
+        statuses = {}
+        for symbol, session in self.playersBySymbol.items():
+            statuses[symbol] = {
+                "alias": session.alias,
+                "status": session.status,
+            }
+        return {
+            "type": eventType,
+            "roomId": self.roomId,
+            "board": list(self.board),
+            "scores": dict(self.scores),
+            "activeTurn": self.activeTurn,
+            "gamePhase": self.gamePhase,
+            "players": statuses,
+            "message": message,
+        }
 
-    def get_board_display(self):
-        b = self.board
-        return f"\n {b[0]} | {b[1]} | {b[2]} \n---+---+---\n {b[3]} | {b[4]} | {b[5]} \n---+---+---\n {b[6]} | {b[7]} | {b[8]} \n"
+    def sendToSessionLocked(self, session: PlayerSession, payload: Dict[str, Any]) -> None:
+        if session.conn is None or session.status != "CONNECTED":
+            return
+        try:
+            with session.sendLock:
+                sendFramedMessage(session.conn, payload)
+        except OSError:
+            session.status = "TEMPORARILY_DISCONNECTED"
+            session.disconnectedAt = time.monotonic()
+            session.conn = None
 
-    def check_winner(self):
-        wins = [
-            (0, 1, 2), (3, 4, 5), (6, 7, 8), # Rows
-            (0, 3, 6), (1, 4, 7), (2, 5, 8), # Cols
-            (0, 4, 8), (2, 4, 6)             # Diagonals
-        ]
-        for a, b, c in wins:
-            if self.board[a] == self.board[b] == self.board[c] and self.board[a] in ["X", "O"]:
-                return self.board[a] # Returns 'X' or 'O'
-        if all(spot in ["X", "O"] for spot in self.board):
-            return "TIE"
-        return None
+    def broadcastLocked(self, payload: Dict[str, Any]) -> None:
+        for session in self.playersBySymbol.values():
+            self.sendToSessionLocked(session, payload)
 
-game_room = GameRoom()
+    def cancelGraceTimerLocked(self) -> None:
+        if self.graceTimer is not None:
+            self.graceTimer.cancel()
+            self.graceTimer = None
+        self.graceDeadline = None
 
-def handle_client(conn, addr):
-    print(f"[NEW CONNECTION] {addr} connected.")
-    
-    with game_room.lock:
-        if len(game_room.players) >= 2:
-            send_message(conn, "SERVER_FULL")
+    def startGraceTimerLocked(self, disconnectedSymbol: str) -> None:
+        self.cancelGraceTimerLocked()
+        self.graceDeadline = time.monotonic() + GRACE_PERIOD_SECONDS
+        timer = threading.Timer(
+            GRACE_PERIOD_SECONDS,
+            self._handleGraceExpiry,
+            args=(disconnectedSymbol,),
+        )
+        timer.daemon = True
+        self.graceTimer = timer
+        timer.start()
+
+    def _handleGraceExpiry(self, disconnectedSymbol: str) -> None:
+        with self.stateLock:
+            session = self.playersBySymbol.get(disconnectedSymbol)
+            if session is None or session.status != "TEMPORARILY_DISCONNECTED":
+                return
+            self.gamePhase = "FORFEITED"
+            opponentSymbol = "O" if disconnectedSymbol == "X" else "X"
+            if opponentSymbol in self.scores:
+                self.scores[opponentSymbol] += 1
+            snapshot = self.buildStateSnapshot(
+                "GAME_OVER",
+                f"Player {disconnectedSymbol} ({session.alias}) did not reconnect within {int(GRACE_PERIOD_SECONDS)}s.",
+            )
+            self.broadcastLocked(snapshot)
+            print(f"[GRACE EXPIRED] Room {self.roomId}: Player {disconnectedSymbol} timed out.")
+
+    def registerOrReconnect(self, alias: str, conn: socket.socket) -> Tuple[bool, str, Optional[PlayerSession]]:
+        with self.stateLock:
+            existing = self.playersByAlias.get(alias)
+            if existing is not None:
+                if existing.status == "CONNECTED" and existing.conn is not None:
+                    return False, f"Alias '{alias}' is already actively connected.", None
+                existing.conn = conn
+                existing.status = "CONNECTED"
+                existing.disconnectedAt = None
+                self.cancelGraceTimerLocked()
+                if self.gamePhase == "PAUSED_DISCONNECT":
+                    self.gamePhase = "IN_PROGRESS"
+                resumePayload = self.buildStateSnapshot(
+                    "STATE_RESUME",
+                    f"Player {existing.symbol} ({alias}) reconnected. Resuming match.",
+                )
+                resumePayload["yourSymbol"] = existing.symbol
+                self.broadcastLocked(resumePayload)
+                print(
+                    f"[RECONNECT] Alias '{alias}' re-bound as Player {existing.symbol}; "
+                    f"sent STATE_RESUME (turn={self.activeTurn}, scores={self.scores})."
+                )
+                return True, f"Reconnected as Player {existing.symbol}.", existing
+
+            if len(self.playersBySymbol) >= 2:
+                return False, "Game room is full.", None
+
+            symbol = "X" if "X" not in self.playersBySymbol else "O"
+            newSession = PlayerSession(alias=alias, symbol=symbol, conn=conn)
+            self.playersByAlias[alias] = newSession
+            self.playersBySymbol[symbol] = newSession
+
+            if len(self.playersBySymbol) == 2:
+                self.gamePhase = "IN_PROGRESS"
+                startPayload = self.buildStateSnapshot(
+                    "GAME_START",
+                    "Both players connected. Player X moves first.",
+                )
+                for sym, sess in self.playersBySymbol.items():
+                    personalPayload = dict(startPayload)
+                    personalPayload["yourSymbol"] = sym
+                    self.sendToSessionLocked(sess, personalPayload)
+                print(f"[GAME START] Room {self.roomId}: X and O ready.")
+            else:
+                self.gamePhase = "WAITING_FOR_PLAYERS"
+                waitPayload = self.buildStateSnapshot(
+                    "WAITING",
+                    f"Joined as Player {symbol} ({alias}). Waiting for opponent...",
+                )
+                waitPayload["yourSymbol"] = symbol
+                self.sendToSessionLocked(newSession, waitPayload)
+                print(f"[JOIN] Alias '{alias}' assigned Player {symbol}.")
+
+            return True, f"Joined as Player {symbol}.", newSession
+
+    def handleDisconnect(self, session: PlayerSession, reason: str) -> None:
+        with self.stateLock:
+            if session.conn is not None:
+                try:
+                    session.conn.close()
+                except OSError:
+                    pass
+                session.conn = None
+
+            if session.status == "TEMPORARILY_DISCONNECTED":
+                return
+
+            session.status = "TEMPORARILY_DISCONNECTED"
+            session.disconnectedAt = time.monotonic()
+
+            if self.gamePhase in ("IN_PROGRESS", "PAUSED_DISCONNECT"):
+                self.gamePhase = "PAUSED_DISCONNECT"
+                self.startGraceTimerLocked(session.symbol)
+                print(
+                    f"[DISCONNECT PRESERVED] {reason} -> Player {session.symbol} ({session.alias}) "
+                    f"marked TEMPORARILY_DISCONNECTED. Holding board={self.board}, "
+                    f"turn={self.activeTurn}, scores={self.scores} for {int(GRACE_PERIOD_SECONDS)}s."
+                )
+                notifyPayload = self.buildStateSnapshot(
+                    "STATE_UPDATE",
+                    f"Player {session.symbol} ({session.alias}) disconnected ({reason}). "
+                    f"State preserved for {int(GRACE_PERIOD_SECONDS)}s grace period.",
+                )
+                self.broadcastLocked(notifyPayload)
+            else:
+                print(f"[DISCONNECT] Player {session.symbol} ({session.alias}) disconnected ({reason}).")
+
+    def applyMove(self, session: PlayerSession, cellIndex: int) -> None:
+        with self.stateLock:
+            if self.gamePhase != "IN_PROGRESS":
+                errPayload = {
+                    "type": "ERROR",
+                    "message": f"Cannot play move while game phase is {self.gamePhase}.",
+                }
+                self.sendToSessionLocked(session, errPayload)
+                return
+
+            if session.symbol != self.activeTurn:
+                errPayload = {
+                    "type": "ERROR",
+                    "message": f"Not your turn. Active turn is Player {self.activeTurn}.",
+                }
+                self.sendToSessionLocked(session, errPayload)
+                return
+
+            if not isinstance(cellIndex, int) or cellIndex < 0 or cellIndex > 8:
+                errPayload = {
+                    "type": "ERROR",
+                    "message": "Cell index must be an integer between 0 and 8.",
+                }
+                self.sendToSessionLocked(session, errPayload)
+                return
+
+            if self.board[cellIndex] != "":
+                errPayload = {
+                    "type": "ERROR",
+                    "message": f"Cell {cellIndex} is already occupied.",
+                }
+                self.sendToSessionLocked(session, errPayload)
+                return
+
+            self.board[cellIndex] = session.symbol
+            winner, isTie = evaluateBoard(self.board)
+
+            if winner is not None:
+                self.scores[winner] += 1
+                self.gamePhase = "ROUND_OVER"
+                endPayload = self.buildStateSnapshot(
+                    "GAME_OVER",
+                    f"Player {winner} wins the round!",
+                )
+                self.broadcastLocked(endPayload)
+                return
+
+            if isTie:
+                self.scores["TIES"] += 1
+                self.gamePhase = "ROUND_OVER"
+                tiePayload = self.buildStateSnapshot(
+                    "GAME_OVER",
+                    "Round ended in a tie.",
+                )
+                self.broadcastLocked(tiePayload)
+                return
+
+            self.activeTurn = "O" if self.activeTurn == "X" else "X"
+            updatePayload = self.buildStateSnapshot(
+                "STATE_UPDATE",
+                f"Player {session.symbol} played cell {cellIndex}. Turn: Player {self.activeTurn}.",
+            )
+            self.broadcastLocked(updatePayload)
+
+    def handleReset(self, session: PlayerSession) -> None:
+        with self.stateLock:
+            self.board = [""] * 9
+            self.activeTurn = "X"
+            self.cancelGraceTimerLocked()
+            if len(self.playersBySymbol) == 2:
+                self.gamePhase = "IN_PROGRESS"
+            else:
+                self.gamePhase = "WAITING_FOR_PLAYERS"
+            resetPayload = self.buildStateSnapshot(
+                "STATE_UPDATE",
+                f"Board reset by {session.alias}. Turn: Player X.",
+            )
+            self.broadcastLocked(resetPayload)
+
+
+def serveClient(conn: socket.socket, addr: Tuple[str, int], room: GameRoom) -> None:
+    session: Optional[PlayerSession] = None
+    try:
+        helloMsg = recvFramedMessage(conn)
+        if helloMsg is None:
             conn.close()
             return
-        game_room.players.append((conn, addr))
-        player_id = len(game_room.players) - 1
-        
-    symbol = "X" if player_id == 0 else "O"
-    send_message(conn, f"Connected as Player {player_id + 1} ({symbol}).")
-    
-    if player_id == 0:
-        send_message(conn, "Waiting for Player 2 to join...")
-    
-    # Wait until 2 players are connected
-    while True:
-        with game_room.lock:
-            if len(game_room.players) < 2:
-                pass
-            else:
+
+        msgType = helloMsg.get("type")
+        alias = str(helloMsg.get("alias", "")).strip()
+        if msgType not in ("CONNECT", "RECONNECT") or not alias:
+            sendFramedMessage(conn, {"type": "ERROR", "message": "First message must include a valid alias."})
+            conn.close()
+            return
+
+        ok, statusMsg, boundSession = room.registerOrReconnect(alias, conn)
+        if not ok or boundSession is None:
+            sendFramedMessage(conn, {"type": "ERROR", "message": statusMsg})
+            conn.close()
+            return
+
+        session = boundSession
+        print(f"[CLIENT BOUND] {alias} ({session.symbol}) from {addr[0]}:{addr[1]}")
+
+        while True:
+            msg = recvFramedMessage(conn)
+            if msg is None:
+                room.handleDisconnect(session, "EOF / client closed socket")
                 break
-        time.sleep(0.5)
-    
-    # If game was reset or starting fresh, initialize board for both when player 2 joins
-    with game_room.lock:
-        if player_id == 0 and game_room.game_over:
-            game_room.reset()
 
-    time.sleep(0.2) # Small sync delay
-    send_message(conn, "UPDATE\nGame Start!\n" + game_room.get_board_display())
-    
-    try:
-        while True:
-            with game_room.lock:
-                if game_room.game_over:
-                    break
-                is_my_turn = (game_room.current_turn % 2 == player_id)
-
-            if is_my_turn:
-                send_message(conn, "YOUR_TURN")
-                move_data = recv_message(conn)
-                if not move_data:
-                    break # Disconnect
-                
-                try:
-                    move_idx = int(move_data.strip()) - 1
-                    with game_room.lock:
-                        if 0 <= move_idx <= 8 and game_room.board[move_idx] not in ["X", "O"]:
-                            game_room.board[move_idx] = symbol
-                            
-                            winner = game_room.check_winner()
-                            if winner:
-                                game_room.game_over = True
-                                # Broadcast final board
-                                for idx, (p_conn, _) in enumerate(game_room.players):
-                                    send_message(p_conn, "UPDATE\n" + game_room.get_board_display())
-                                    if winner == "TIE":
-                                        send_message(p_conn, "TIE")
-                                    elif (winner == "X" and idx == 0) or (winner == "O" and idx == 1):
-                                        send_message(p_conn, "WIN")
-                                    else:
-                                        send_message(p_conn, "LOSE")
-                            else:
-                                game_room.current_turn += 1
-                                for p_conn, _ in game_room.players:
-                                    send_message(p_conn, "UPDATE\n" + game_room.get_board_display())
-                        else:
-                            send_message(conn, "INVALID_MOVE")
-                except ValueError:
-                    send_message(conn, "INVALID_MOVE")
+            command = msg.get("type")
+            if command == "MOVE":
+                cell = msg.get("cell")
+                room.applyMove(session, cell)
+            elif command == "RESET":
+                room.handleReset(session)
             else:
-                send_message(conn, "WAITING")
-                # Wait until turn changes or game ends
-                while True:
-                    with game_room.lock:
-                        if game_room.game_over or (game_room.current_turn % 2 == player_id):
-                            break
-                    time.sleep(0.2)
-                    
-    except (ConnectionResetError, BrokenPipeError):
-        print(f"[DISCONNECT] {addr} closed unexpectedly.")
-    finally:
-        with game_room.lock:
-            # Remove this player from room
-            game_room.players = [p for p in game_room.players if p[0] != conn]
-            game_room.reset() # Reset room so next players get a fresh game
-            # Notify remaining player if any
-            for p_conn, _ in game_room.players:
-                try:
-                    send_message(p_conn, "\n[NOTICE] Opponent disconnected. Resetting room, waiting for new player...")
-                except:
-                    pass
-        conn.close()
-        print(f"[CLOSED] Connection with {addr} terminated.")
+                room.sendToSessionLocked(
+                    session,
+                    {"type": "ERROR", "message": f"Unknown message type: {command}"},
+                )
 
-def main():
-    parser = argparse.ArgumentParser(description="Sprint 3 Server Application")
-    parser.add_argument('-p', '--port', required=True, type=int, help="Listening port")
-    args = parser.parse_args()
+    except ConnectionResetError as exc:
+        if session is not None:
+            room.handleDisconnect(session, f"ConnectionResetError: {exc}")
+    except BrokenPipeError as exc:
+        if session is not None:
+            room.handleDisconnect(session, f"BrokenPipeError: {exc}")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if session is not None:
+            room.handleDisconnect(session, f"Socket/Protocol error: {exc}")
+        else:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    server_socket.bind(('0.0.0.0', args.port))
-    server_socket.listen()
-    print(f"[LISTENING] Server is listening on 0.0.0.0:{args.port}")
+
+def parseArguments(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="CS-457 Stateful Tic-Tac-Toe TCP Server"
+    )
+    parser.add_argument(
+        "-i",
+        "--ip",
+        dest="host",
+        default=DEFAULT_HOST,
+        help=f"Bind IP address (default: {DEFAULT_HOST})",
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        dest="port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"Bind TCP port (default: {DEFAULT_PORT})",
+    )
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = parseArguments(sys.argv[1:])
+    room = GameRoom(roomId="LUKA-ROOM-1")
+
+    serverSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serverSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    serverSock.bind((args.host, args.port))
+    serverSock.listen(16)
+    print(f"[SERVER LISTENING] {args.host}:{args.port} (grace={int(GRACE_PERIOD_SECONDS)}s)")
 
     try:
         while True:
-            conn, addr = server_socket.accept()
-            thread = threading.Thread(target=handle_client, args=(conn, addr))
-            thread.daemon = True
-            thread.start()
-            print(f"[ACTIVE CONNECTIONS] {threading.active_count() - 1}")
-            
+            conn, addr = serverSock.accept()
+            worker = threading.Thread(
+                target=serveClient,
+                args=(conn, addr, room),
+                daemon=True,
+            )
+            worker.start()
     except KeyboardInterrupt:
-        print("\n[SHUTDOWN] Server is shutting down.")
+        print("\n[SERVER SHUTDOWN] Stopping listener.")
     finally:
-        server_socket.close()
+        serverSock.close()
+
 
 if __name__ == "__main__":
     main()
